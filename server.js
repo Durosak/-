@@ -15,6 +15,23 @@ import fs from "node:fs";
 import path from "node:path";
 import vm from "node:vm";
 import { fileURLToPath } from "node:url";
+import {
+  thanawicaLogin,
+  thSubjectsForYear,
+  thTeachers,
+  thChapters,
+  thLectures,
+  thLectureContent,
+  thGetVideoSource,
+  thMintAndFetchSegment,
+  isChemOrMathName,
+  chemMathKind,
+  isThId,
+  encodeThId,
+  decodeThId,
+  getThanawicaSessionInfo
+} from "./thanawica.js";
+
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.join(__dirname, "data");
@@ -334,6 +351,8 @@ const CONFIG = {
   STREAM_IDLE_MS: 45 * 60 * 1000, // الجلسة بتنتهي بعد 45 دقيقة من آخر مقطع اتطلب (كانت 15 دقيقة ثابتة وبتقطع المحاضرات الطويلة)
   STREAM_MAX_MS: 12 * 3600 * 1000,
   MAX_PROXY_BYTES: 12 * 1024 * 1024,
+  THANAWICA_CODE: process.env.THANAWICA_CODE || "", // أو من thanawica_code.txt
+  THANAWICA_ENABLED: process.env.THANAWICA_ENABLED !== "0",
   CODE_TYPES: {
     trial: { label: "تجربة", ms: 1 * 3600 * 1000 },
     month: { label: "شهر", ms: 30 * 24 * 3600 * 1000 },
@@ -1648,9 +1667,53 @@ app.get("/api/subjects/:id", requireStudent, async (req, res) => {
       }
     }
 
-    const results = await Promise.all(wantedIds.map((sid, idx) =>
+    let results = await Promise.all(wantedIds.map((sid, idx) =>
       resolveOne(sid).then((s) => ({ ...s, order_index: idx + 1 }))
     ));
+
+    // Hybrid: replace chemistry/math with Thanawica subjects (same year), keep everything else from Coursatk
+    if (CONFIG.THANAWICA_ENABLED) {
+      try {
+        const thList = await thSubjectsForYear(yearId);
+        const thByKind = new Map(thList.map((s) => [s._kind, s]));
+        const filtered = [];
+        let replacedChem = false;
+        let replacedMath = false;
+        for (const s of results) {
+          const kind = chemMathKind(s.name);
+          if (kind && thByKind.has(kind)) {
+            if (kind === "chemistry" && replacedChem) continue;
+            if (kind === "math" && replacedMath) continue;
+            const th = thByKind.get(kind);
+            filtered.push({
+              ...th,
+              order_index: s.order_index,
+              name: th.name || s.name,
+              image_url: s.image_url || th.image_url || null
+            });
+            if (kind === "chemistry") replacedChem = true;
+            if (kind === "math") replacedMath = true;
+          } else if (!kind) {
+            filtered.push(s);
+          } else {
+            // chem/math name but no th mapping — keep original
+            filtered.push(s);
+          }
+        }
+        // if upstream had no chem/math names, still append Thanawica ones
+        for (const [kind, th] of thByKind) {
+          const has = filtered.some((x) => chemMathKind(x.name) === kind || x._kind === kind);
+          if (!has) filtered.push({ ...th, order_index: filtered.length + 1 });
+        }
+        results = filtered;
+        console.log("[subjects] hybrid thanawica chem/math injected", {
+          student: req.student.code,
+          th: results.filter((x) => x._source === "thanawica").map((x) => x.name)
+        });
+      } catch (e) {
+        console.warn("[subjects] thanawica hybrid skip:", e.message);
+      }
+    }
 
     res.json({
       success: true,
@@ -1664,6 +1727,10 @@ app.get("/api/subjects/:id", requireStudent, async (req, res) => {
 
 app.get("/api/subjects/:id/teachers", requireStudent, async (req, res) => {
   try {
+    if (CONFIG.THANAWICA_ENABLED && isThId(req.params.id)) {
+      const data = await thTeachers(req.params.id);
+      return res.json({ success: true, message: "Success", data });
+    }
     res.json(
       await upstreamJson(`/user/subjects/${encodeURIComponent(req.params.id)}/teachers`)
     );
@@ -1674,6 +1741,10 @@ app.get("/api/subjects/:id/teachers", requireStudent, async (req, res) => {
 
 app.get("/api/teachers/:id/chapters", requireStudent, async (req, res) => {
   try {
+    if (CONFIG.THANAWICA_ENABLED && isThId(req.params.id)) {
+      const data = await thChapters(req.params.id);
+      return res.json({ success: true, message: "Success", data });
+    }
     res.json(
       await upstreamJson(`/user/teachers/${encodeURIComponent(req.params.id)}/chapters`)
     );
@@ -1684,6 +1755,10 @@ app.get("/api/teachers/:id/chapters", requireStudent, async (req, res) => {
 
 app.get("/api/chapters/:id/lectures", requireStudent, async (req, res) => {
   try {
+    if (CONFIG.THANAWICA_ENABLED && isThId(req.params.id)) {
+      const data = await thLectures(req.params.id);
+      return res.json({ success: true, message: "Success", data });
+    }
     res.json(
       await upstreamJson(`/user/chapters/${encodeURIComponent(req.params.id)}/lectures`)
     );
@@ -1694,6 +1769,9 @@ app.get("/api/chapters/:id/lectures", requireStudent, async (req, res) => {
 
 app.get("/api/lectures/:id/content", requireStudent, async (req, res) => {
   try {
+    if (CONFIG.THANAWICA_ENABLED && isThId(req.params.id)) {
+      return res.json(await thLectureContent(req.params.id));
+    }
     res.json(
       await upstreamJson(`/user/lectures/${encodeURIComponent(req.params.id)}/content`)
     );
@@ -1889,6 +1967,27 @@ function getVideoSource(videoId, clientHeaders) {
   const hit = sourceCache.get(videoId);
   if (hit && now() < hit.exp) return Promise.resolve(hit.src);
   return coalesce("src:" + videoId, async () => {
+    // Thanawica video ids: thp_<playlistHash> or thv_<pageVideoId>
+    if (CONFIG.THANAWICA_ENABLED && /^th[pv]_/.test(String(videoId))) {
+      let hash = null;
+      if (String(videoId).startsWith("thp_")) {
+        hash = String(videoId).slice(4);
+      } else {
+        // thv_ — resolve via lecture content cache is caller's responsibility;
+        // try treating remainder as hash if long hex, else error clearly
+        const rest = String(videoId).slice(4);
+        if (/^[a-f0-9]{20,}$/i.test(rest)) hash = rest;
+        else {
+          const e = new Error("فيديو ثناويكا يحتاج playlist hash — افتح المحاضرة من جديد");
+          e.status = 400;
+          throw e;
+        }
+      }
+      const src = await thGetVideoSource(hash, { sidToken: SID_TOKEN });
+      src.reqVideoId = videoId;
+      sourceCache.set(videoId, { src, exp: now() + SOURCE_TTL_MS });
+      return src;
+    }
     const src = await buildVideoSource(videoId, clientHeaders);
     sourceCache.set(videoId, { src, exp: now() + SOURCE_TTL_MS });
     return src;
@@ -1982,6 +2081,20 @@ async function getSegmentPlain(session, meta, url, iv, headers) {
   return coalesce("seg:" + key, async () => {
     const hit2 = segGet(key);
     if (hit2) return hit2;
+
+    // Thanawica path: mint token + fetch + WASM decrypt (210-byte pad)
+    if (session.src.mode === "thanawica" && typeof session.src._thDecrypt === "function") {
+      const encrypted = await thMintAndFetchSegment(meta);
+      if (encrypted.length > CONFIG.MAX_PROXY_BYTES) {
+        const e = new Error("المقطع كبير");
+        e.status = 413;
+        throw e;
+      }
+      const ivHex = meta.iv || (iv ? Buffer.from(iv).toString("hex") : null);
+      const plain = await session.src._thDecrypt(encrypted, ivHex);
+      segSet(key, plain);
+      return plain;
+    }
 
     let up = await streamFetch(session.src, url, {}, headers);
     if ((up.status === 401 || up.status === 403) && Number.isFinite(meta.s)) {
@@ -3493,6 +3606,14 @@ setInterval(() => {
 // Boot: hash bootstrap password properly + load crypto
 CONFIG.BOOTSTRAP_ADMIN.passwordHash = scryptHash(CONFIG.BOOTSTRAP_ADMIN.passwordPlain);
 await loadDecryptionUtils();
+try {
+  if (CONFIG.THANAWICA_ENABLED && CONFIG.THANAWICA_CODE) {
+    await thanawicaLogin(CONFIG.THANAWICA_CODE);
+    console.log("[API] Thanawica hybrid ON — chemistry/math from thanawica.com");
+  }
+} catch (e) {
+  console.warn("[API] Thanawica login skipped:", e.message);
+}
 
 // Load site packages/agents from Firebase if configured
 try {
