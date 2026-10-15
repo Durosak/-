@@ -15,6 +15,24 @@ import fs from "node:fs";
 import path from "node:path";
 import vm from "node:vm";
 import { fileURLToPath } from "node:url";
+import {
+  thanawicaLogin,
+  thSubjectsForYear,
+  thTeachers,
+  thChapters,
+  thLectures,
+  thLectureContent,
+  thGetVideoSource,
+  thMintAndFetchSegment,
+  thResolvePlaylistHash,
+  isChemOrMathName,
+  chemMathKind,
+  isThId,
+  encodeThId,
+  decodeThId,
+  getThanawicaSessionInfo
+} from "./thanawica.js";
+
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.join(__dirname, "data");
@@ -49,12 +67,15 @@ for (const m of ["get", "post", "put", "patch", "delete", "use"]) {
   };
 }
 app.set("trust proxy", 1);
-app.use(cors({ origin: true, credentials: false }));
+app.use(cors({
+  origin: true, // يعكس الـ Origin عشان credentials تشتغل
+  credentials: true
+}));
 app.use(express.json({ limit: "20mb" }));
 app.use(
   compression({
     // مقاطع الفيديو مش بتتضغط — بلاش نصرف CPU عليها
-    filter: (req, res) => (req.path.startsWith("/api/stream/segment/") ? false : compression.filter(req, res))
+    filter: (req, res) => (req.path.startsWith("/api/hls/") || req.path.startsWith("/api/stream/segment/") ? false : compression.filter(req, res))
   })
 );
 
@@ -301,7 +322,9 @@ const CONFIG = {
     "api.coursatk.online",
     "stream-weave.com",
     "floravon.online",
-    "c-cdn.online"
+    "c-cdn.online",
+    "thanawica.com",
+    "www.thanawica.com"
   ],
   STREAM_ORIGIN: "https://coursatk.online",
   STREAM_REFERER: "https://coursatk.online/",
@@ -334,6 +357,8 @@ const CONFIG = {
   STREAM_IDLE_MS: 45 * 60 * 1000, // الجلسة بتنتهي بعد 45 دقيقة من آخر مقطع اتطلب (كانت 15 دقيقة ثابتة وبتقطع المحاضرات الطويلة)
   STREAM_MAX_MS: 12 * 3600 * 1000,
   MAX_PROXY_BYTES: 12 * 1024 * 1024,
+  THANAWICA_CODE: process.env.THANAWICA_CODE || "", // أو من thanawica_code.txt
+  THANAWICA_ENABLED: process.env.THANAWICA_ENABLED !== "0",
   CODE_TYPES: {
     trial: { label: "تجربة", ms: 1 * 3600 * 1000 },
     month: { label: "شهر", ms: 30 * 24 * 3600 * 1000 },
@@ -808,6 +833,12 @@ function getBearer(req) {
   const xt = req.headers["x-session-token"];
   if (xt) return String(xt).trim();
   if (req.query && req.query.token) return String(req.query.token).trim();
+  // كوكي HttpOnly — Safari native HLS يبعتها أوتوماتيك من غير ما تظهر في الـ URL
+  const cookie = String(req.headers.cookie || "");
+  const m = cookie.match(/(?:^|;\s*)ds_session=([^;]+)/);
+  if (m) {
+    try { return decodeURIComponent(m[1].trim()); } catch { return m[1].trim(); }
+  }
   return "";
 }
 
@@ -1298,11 +1329,20 @@ app.use(
     max: 1500,
     windowMs: 60_000,
     scope: "global",
-    skip: (req) => req.path.startsWith("/api/stream/") || req.path === "/health"
+    skip: (req) => req.path.startsWith("/api/stream/") || req.path.startsWith("/api/hls/") || req.path === "/health"
   })
 );
 app.use(
   "/api/stream/",
+  rateLimit({
+    max: 1500,
+    windowMs: 60_000,
+    scope: "stream",
+    keyFn: (req) => "t:" + (getBearer(req) || clientIp(req))
+  })
+);
+app.use(
+  "/api/hls/",
   rateLimit({
     max: 1500,
     windowMs: 60_000,
@@ -1648,9 +1688,53 @@ app.get("/api/subjects/:id", requireStudent, async (req, res) => {
       }
     }
 
-    const results = await Promise.all(wantedIds.map((sid, idx) =>
+    let results = await Promise.all(wantedIds.map((sid, idx) =>
       resolveOne(sid).then((s) => ({ ...s, order_index: idx + 1 }))
     ));
+
+    // Hybrid: replace chemistry/math with Thanawica subjects (same year), keep everything else from Coursatk
+    if (CONFIG.THANAWICA_ENABLED) {
+      try {
+        const thList = await thSubjectsForYear(yearId);
+        const thByKind = new Map(thList.map((s) => [s._kind, s]));
+        const filtered = [];
+        let replacedChem = false;
+        let replacedMath = false;
+        for (const s of results) {
+          const kind = chemMathKind(s.name);
+          if (kind && thByKind.has(kind)) {
+            if (kind === "chemistry" && replacedChem) continue;
+            if (kind === "math" && replacedMath) continue;
+            const th = thByKind.get(kind);
+            filtered.push({
+              ...th,
+              order_index: s.order_index,
+              name: th.name || s.name,
+              image_url: s.image_url || th.image_url || null
+            });
+            if (kind === "chemistry") replacedChem = true;
+            if (kind === "math") replacedMath = true;
+          } else if (!kind) {
+            filtered.push(s);
+          } else {
+            // chem/math name but no th mapping — keep original
+            filtered.push(s);
+          }
+        }
+        // if upstream had no chem/math names, still append Thanawica ones
+        for (const [kind, th] of thByKind) {
+          const has = filtered.some((x) => chemMathKind(x.name) === kind || x._kind === kind);
+          if (!has) filtered.push({ ...th, order_index: filtered.length + 1 });
+        }
+        results = filtered;
+        console.log("[subjects] hybrid thanawica chem/math injected", {
+          student: req.student.code,
+          th: results.filter((x) => x._source === "thanawica").map((x) => x.name)
+        });
+      } catch (e) {
+        console.warn("[subjects] thanawica hybrid skip:", e.message);
+      }
+    }
 
     res.json({
       success: true,
@@ -1664,6 +1748,10 @@ app.get("/api/subjects/:id", requireStudent, async (req, res) => {
 
 app.get("/api/subjects/:id/teachers", requireStudent, async (req, res) => {
   try {
+    if (CONFIG.THANAWICA_ENABLED && isThId(req.params.id)) {
+      const data = await thTeachers(req.params.id);
+      return res.json({ success: true, message: "Success", data });
+    }
     res.json(
       await upstreamJson(`/user/subjects/${encodeURIComponent(req.params.id)}/teachers`)
     );
@@ -1674,6 +1762,10 @@ app.get("/api/subjects/:id/teachers", requireStudent, async (req, res) => {
 
 app.get("/api/teachers/:id/chapters", requireStudent, async (req, res) => {
   try {
+    if (CONFIG.THANAWICA_ENABLED && isThId(req.params.id)) {
+      const data = await thChapters(req.params.id);
+      return res.json({ success: true, message: "Success", data });
+    }
     res.json(
       await upstreamJson(`/user/teachers/${encodeURIComponent(req.params.id)}/chapters`)
     );
@@ -1684,6 +1776,10 @@ app.get("/api/teachers/:id/chapters", requireStudent, async (req, res) => {
 
 app.get("/api/chapters/:id/lectures", requireStudent, async (req, res) => {
   try {
+    if (CONFIG.THANAWICA_ENABLED && isThId(req.params.id)) {
+      const data = await thLectures(req.params.id);
+      return res.json({ success: true, message: "Success", data });
+    }
     res.json(
       await upstreamJson(`/user/chapters/${encodeURIComponent(req.params.id)}/lectures`)
     );
@@ -1694,6 +1790,9 @@ app.get("/api/chapters/:id/lectures", requireStudent, async (req, res) => {
 
 app.get("/api/lectures/:id/content", requireStudent, async (req, res) => {
   try {
+    if (CONFIG.THANAWICA_ENABLED && isThId(req.params.id)) {
+      return res.json(await thLectureContent(req.params.id));
+    }
     res.json(
       await upstreamJson(`/user/lectures/${encodeURIComponent(req.params.id)}/content`)
     );
@@ -1781,9 +1880,9 @@ async function buildPlaylist(src, masterText, clientHeaders) {
       const seq = mediaSeq + segIndex;
       const iv = currentIv || ivFromMediaSequence(seq);
       const ivHex = iv.toString("hex");
-      const payload = Buffer.from(JSON.stringify({ u: segmentUrl, iv: ivHex, s: seq }), "utf8").toString("base64url");
-      out.push(`/api/stream/segment/${SID_TOKEN}/${payload}`);
-      segs.push({ u: segmentUrl, iv: ivHex, s: seq });
+      // مسار معتم: رقم المقطع فقط — مفيش روابط أبلستريم ولا base64 ظاهر للعميل
+      out.push(`/api/hls/${SID_TOKEN}/seg/${segIndex}`);
+      segs.push({ u: segmentUrl, iv: ivHex, s: seq, i: segIndex });
       segIndex++;
       continue;
     }
@@ -1889,6 +1988,42 @@ function getVideoSource(videoId, clientHeaders) {
   const hit = sourceCache.get(videoId);
   if (hit && now() < hit.exp) return Promise.resolve(hit.src);
   return coalesce("src:" + videoId, async () => {
+    // Thanawica video ids: thp_<playlistHash> or thv_<pageVideoId>
+    if (CONFIG.THANAWICA_ENABLED && /^th[pv]_/.test(String(videoId))) {
+      let hash = null;
+      const raw = String(videoId);
+      if (raw.startsWith("thp_")) {
+        hash = raw.slice(4);
+      } else {
+        // thv_<pageVideoId> or thv_<hexHash>
+        const rest = raw.slice(4);
+        if (/^[a-f0-9]{16,}$/i.test(rest)) {
+          hash = rest;
+        } else if (/^\d+$/.test(rest)) {
+          // Resolve numeric video page id → playlist hash (optional ?lecture= or body)
+          // Clients may pass lecture via query; try common cache keys via thResolve
+          // lecture id is required for the video page URL — accept from clientHeaders? no.
+          // Fallback: error with clear message unless lectureId provided in videoId form thv_LEC_VID
+          // Support thv_<videoPageId> with lecture in query string on play route — handled below via global
+          const e = new Error("فيديو ثناويكا: افتح المحاضرة من جديد (الـ id لازم thp_hash)");
+          e.status = 400;
+          throw e;
+        } else {
+          const e = new Error("فيديو ثناويكا غير صالح");
+          e.status = 400;
+          throw e;
+        }
+      }
+      if (!hash) {
+        const e = new Error("فيديو ثناويكا يحتاج playlist hash");
+        e.status = 400;
+        throw e;
+      }
+      const src = await thGetVideoSource(hash, { sidToken: SID_TOKEN });
+      src.reqVideoId = videoId;
+      sourceCache.set(videoId, { src, exp: now() + SOURCE_TTL_MS });
+      return src;
+    }
     const src = await buildVideoSource(videoId, clientHeaders);
     sourceCache.set(videoId, { src, exp: now() + SOURCE_TTL_MS });
     return src;
@@ -1931,26 +2066,49 @@ function getStreamSession(id, touch = true) {
 
 app.post("/api/play/:videoId", requireStudent, async (req, res) => {
   try {
-    const videoId = String(req.params.videoId);
+    let videoId = String(req.params.videoId);
+    // Resolve thv_<numeric> using lectureId from body/query → playlist hash → thp_
+    if (CONFIG.THANAWICA_ENABLED && /^thv_\d+$/i.test(videoId)) {
+      const pageId = videoId.slice(4);
+      const lecRaw = req.body?.lectureId ?? req.query?.lectureId ?? req.body?.lecture ?? req.query?.lecture;
+      let lec = lecRaw != null ? Number(lecRaw) : null;
+      if (lec != null && lec >= 9_000_000) lec = lec - 9_000_000;
+      if (lec != null && Number.isFinite(lec) && lec > 0) {
+        try {
+          const hash = await thResolvePlaylistHash(lec, pageId);
+          videoId = "thp_" + hash;
+        } catch (e) {
+          return jsonError(res, 502, e.message || "تعذر جلب فيديو ثناويكا");
+        }
+      }
+    }
     const src = await getVideoSource(videoId, req.headers);
 
-    const id = crypto.randomUUID();
+    // معرف تشغيل معتم — مش بيكشف أي حاجة عن الحساب أو المصدر
+    const id = crypto.randomUUID().replace(/-/g, "");
     streamSessions.set(id, {
       id,
       src,
       videoId: src.videoId,
       ownerCode: req.session.code,
+      ownerToken: req.sessionToken, // لربط الطلبات بنفس الجلسة
       createdAt: now(),
       lastUsed: now()
     });
 
+    // كوكي جلسة للطالب — عشان Safari/native HLS يبعت التوكن من غير ما يظهر في الروابط
+    try {
+      const secure = (req.secure || req.headers["x-forwarded-proto"] === "https") ? "; Secure" : "";
+      res.setHeader(
+        "Set-Cookie",
+        `ds_session=${encodeURIComponent(req.sessionToken)}; Path=/; HttpOnly; SameSite=None${secure}; Max-Age=${7 * 24 * 3600}`
+      );
+    } catch {}
+    // العميل بيشوف رابط تشغيل واحد بس — مفيش sessionId ولا mode ولا توكن في الـ URL
     res.json({
       success: true,
       data: {
-        session: id,
-        video_id: src.videoId,
-        mode: src.mode,
-        manifest_url: `/api/stream/manifest/${id}`
+        play_url: `/api/hls/${id}/master.m3u8`
       }
     });
   } catch (e) {
@@ -1959,22 +2117,30 @@ app.post("/api/play/:videoId", requireStudent, async (req, res) => {
   }
 });
 
-// الـ playlist جاهزة في الرامات — مفيش أي طلب للسيرفر الأصلي هنا
-app.get("/api/stream/manifest/:sessionId", requireStudent, async (req, res) => {
-  const session = getStreamSession(req.params.sessionId);
-  if (!session) return jsonError(res, 404, "جلسة التشغيل منتهية");
+/**
+ * HLS master — لازم توكن حساب الطالب (header أو query)
+ * المسار معتم: مفيش بيانات أبلستريم ظاهرة
+ */
+app.get("/api/hls/:pid/master.m3u8", requireStudent, async (req, res) => {
+  const session = getStreamSession(req.params.pid);
+  if (!session) return jsonError(res, 404, "انتهت صلاحية التشغيل");
   if (session.ownerCode !== req.session.code) {
-    return jsonError(res, 403, "جلسة تشغيل ليست لك");
+    return jsonError(res, 403, "غير مصرح");
   }
+  // استبدال الـ placeholder بالمعرّف الحقيقي
+  const body = session.src.playlist.split(SID_TOKEN).join(session.id);
   res.set({
     "Content-Type": "application/vnd.apple.mpegurl",
-    "Cache-Control": "no-store",
-    "Access-Control-Allow-Origin": "*"
+    "Cache-Control": "no-store"
   });
-  res.send(session.src.playlist.split(SID_TOKEN).join(session.id));
+  res.send(body);
 });
 
-// يجيب المقطع المفكوك: من الرامات لو موجود، أو من السيرفر الأصلي مرة واحدة بس حتى لو 100 طالب طلبوه
+/**
+ * مقطع فيديو بالمؤشر فقط — السيرفر بيجيب الرابط الحقيقي من الذاكرة وبيفك التشفير
+ * مفيش base64 فيه روابط thanawica/coursatk
+ */
+
 async function getSegmentPlain(session, meta, url, iv, headers) {
   const key = url + "|" + (meta.iv || "");
   const hit = segGet(key);
@@ -1982,6 +2148,20 @@ async function getSegmentPlain(session, meta, url, iv, headers) {
   return coalesce("seg:" + key, async () => {
     const hit2 = segGet(key);
     if (hit2) return hit2;
+
+    // Thanawica path: mint token + fetch + WASM decrypt (210-byte pad)
+    if (session.src.mode === "thanawica" && typeof session.src._thDecrypt === "function") {
+      const encrypted = await thMintAndFetchSegment(meta);
+      if (encrypted.length > CONFIG.MAX_PROXY_BYTES) {
+        const e = new Error("المقطع كبير");
+        e.status = 413;
+        throw e;
+      }
+      const ivHex = meta.iv || (iv ? Buffer.from(iv).toString("hex") : null);
+      const plain = await session.src._thDecrypt(encrypted, ivHex);
+      segSet(key, plain);
+      return plain;
+    }
 
     let up = await streamFetch(session.src, url, {}, headers);
     if ((up.status === 401 || up.status === 403) && Number.isFinite(meta.s)) {
@@ -2011,7 +2191,7 @@ async function getSegmentPlain(session, meta, url, iv, headers) {
 // تسخين المقاطع الجاية في الخلفية — الطالب (وزمايله) بيلاقوها جاهزة بدل ما يستنوا
 function prefetchAhead(session, meta, headers) {
   if (!PREFETCH_AHEAD || !Number.isFinite(meta.s)) return;
-  if (upstreamSlot.stats().queued > 8) return; // السيرفر الأصلي مشغول — الأولوية للطلبات الحقيقية
+  if (upstreamSlot.stats().queued > 8) return;
   const src = session.src;
   const idx = meta.s - src.mediaSeq;
   if (!(idx >= 0)) return;
@@ -2021,30 +2201,41 @@ function prefetchAhead(session, meta, headers) {
     const key = sg.u + "|" + sg.iv;
     if (segCache.has(key) || inflight.has("seg:" + key)) continue;
     const iv = parseIvHex(sg.iv) || src.defaultIv || ivFromMediaSequence(sg.s);
-    getSegmentPlain(session, { s: sg.s, iv: sg.iv }, sg.u, iv, headers).catch(() => {});
+    getSegmentPlain(session, { ...sg, s: sg.s, iv: sg.iv }, sg.u, iv, headers).catch(() => {});
   }
 }
 
-app.get("/api/stream/segment/:sessionId/:encoded", requireStudent, async (req, res) => {
-  const session = getStreamSession(req.params.sessionId);
-  if (!session) return jsonError(res, 404, "جلسة التشغيل منتهية");
-  if (session.ownerCode !== req.session.code) return jsonError(res, 403, "جلسة ليست لك");
-  if (!session.src.plainKey) return jsonError(res, 404, "مفتاح غير متاح");
-
-  let meta;
-  try {
-    meta = JSON.parse(Buffer.from(req.params.encoded, "base64url").toString("utf8"));
-  } catch {
-    return jsonError(res, 400, "segment meta غير صالح");
+app.get("/api/hls/:pid/seg/:idx", requireStudent, async (req, res) => {
+  const session = getStreamSession(req.params.pid);
+  if (!session) return jsonError(res, 404, "انتهت صلاحية التشغيل");
+  if (session.ownerCode !== req.session.code) return jsonError(res, 403, "غير مصرح");
+  if (!session.src.plainKey && session.src.mode !== "thanawica") {
+    return jsonError(res, 404, "غير متاح");
   }
-  const url = meta?.u;
-  if (!url || !allowedStreamUrl(url, session.src)) return jsonError(res, 403, "رابط غير مسموح");
 
-  const iv = parseIvHex(meta.iv) || session.src.defaultIv || ivFromMediaSequence(meta.s || 0);
+  const idx = Number(req.params.idx);
+  if (!Number.isFinite(idx) || idx < 0) return jsonError(res, 400, "طلب غير صالح");
+
+  const segs = session.src.segs || [];
+  const sg = segs[idx];
+  if (!sg) return jsonError(res, 404, "المقطع غير موجود");
+
+  const url = sg.u;
+  const isTh = session.src?.mode === "thanawica";
+  if (!url || (!isTh && !allowedStreamUrl(url, session.src))) {
+    return jsonError(res, 403, "غير مصرح");
+  }
+  if (isTh && url && !/thanawica\.com/i.test(String(url))) {
+    return jsonError(res, 403, "غير مصرح");
+  }
+
+  // مرّر كل بيانات المقطع (مهم لـ thanawica mint: q/h/v)
+  const meta = { ...sg, u: url, iv: sg.iv, s: sg.s };
+  const iv = parseIvHex(sg.iv) || session.src.defaultIv || ivFromMediaSequence(sg.s || 0);
+
   try {
     let plain;
-    if (req.headers.range) {
-      // طلبات الـ Range نادرة — بتروح مباشرة من غير كاش (زي السلوك القديم)
+    if (req.headers.range && !isTh) {
       const upstream = await streamFetch(session.src, url, { Range: req.headers.range }, req.headers);
       if (!upstream.ok && upstream.status !== 206) throw new Error(`Segment HTTP ${upstream.status}`);
       const encrypted = Buffer.from(await upstream.arrayBuffer());
@@ -2061,8 +2252,7 @@ app.get("/api/stream/segment/:sessionId/:encoded", requireStudent, async (req, r
     res.set({
       "Content-Type": "video/mp2t",
       "Content-Length": String(plain.length),
-      "Cache-Control": "no-store",
-      "Access-Control-Allow-Origin": "*"
+      "Cache-Control": "no-store"
     });
     res.send(plain);
     if (!req.headers.range) prefetchAhead(session, meta, req.headers);
@@ -2070,6 +2260,14 @@ app.get("/api/stream/segment/:sessionId/:encoded", requireStudent, async (req, r
     if (!res.headersSent) jsonError(res, e.status || 502, e.message);
     else res.end();
   }
+});
+
+// ── مسارات قديمة (مقفولة) — عشان محدش يستخدم الشكل اللي بيفضح البيانات ──
+app.get("/api/stream/manifest/:sessionId", (_req, res) => {
+  return jsonError(res, 410, "المسار لم يعد متاحًا");
+});
+app.get("/api/stream/segment/:sessionId/:encoded", (_req, res) => {
+  return jsonError(res, 410, "المسار لم يعد متاحًا");
 });
 
 // ═══════════════════════════════════════════════════════════
@@ -3493,6 +3691,14 @@ setInterval(() => {
 // Boot: hash bootstrap password properly + load crypto
 CONFIG.BOOTSTRAP_ADMIN.passwordHash = scryptHash(CONFIG.BOOTSTRAP_ADMIN.passwordPlain);
 await loadDecryptionUtils();
+try {
+  if (CONFIG.THANAWICA_ENABLED && CONFIG.THANAWICA_CODE) {
+    await thanawicaLogin(CONFIG.THANAWICA_CODE);
+    console.log("[API] Thanawica hybrid ON — chemistry/math from thanawica.com");
+  }
+} catch (e) {
+  console.warn("[API] Thanawica login skipped:", e.message);
+}
 
 // Load site packages/agents from Firebase if configured
 try {
