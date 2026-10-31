@@ -1,7 +1,5 @@
-# fly.toml app configuration file generated for drosak on 2026-10-31T13:29:33Z
-#
-# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
-#
+# fly.toml app configuration file generated for drosak
+# See https://fly.io/docs/reference/configuration/
 
 app = 'drosak'
 primary_region = 'ams'
@@ -11,8 +9,8 @@ primary_region = 'ams'
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = 'stop'
-  auto_start_machines = true
+  auto_stop_machines = "off"
+  auto_start_machines = false
   min_machines_running = 1
   processes = ['app']
 
