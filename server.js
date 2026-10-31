@@ -353,7 +353,7 @@ setInterval(() => {
 // CONFIG (in-code — no Railway vars required for core secrets)
 // ═══════════════════════════════════════════════════════════
 const CONFIG = {
-  PORT: Number(process.env.PORT || 3000),
+PORT: Number(process.env.PORT || 8080),
   // Upstream Coursatk — token loaded from runtime/Firebase/env (never exposed to client)
   COURSATK_API: "https://api.coursatk.online/api/v1",
   COURSATK_TOKEN: "", // set via admin panel or env COURSATK_TOKEN
@@ -4902,7 +4902,7 @@ try {
   console.warn("[API] section seed skip:", e.message);
 }
 
-const server = app.listen(CONFIG.PORT, () => {
+const server = app.listen(CONFIG.PORT, "0.0.0.0", () => {
   console.log(`[API ${APP_VERSION}] :${CONFIG.PORT} protected · segment-decrypt ON · segment-cache ${Math.round(SEG_CACHE_MAX / 1048576)}MB`);
   console.log(`[API] bootstrap admin ready (Hema)`);
 });
