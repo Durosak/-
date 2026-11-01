@@ -1,6 +1,4 @@
-# fly.toml app configuration file generated for drosak
-# See https://fly.io/docs/reference/configuration/
-
+# Fly.io app configuration
 app = 'drosak'
 primary_region = 'ams'
 
