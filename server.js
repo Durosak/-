@@ -1343,6 +1343,10 @@ function priceForType(type) {
   return SALE_DEFAULT_PRICES[type] || 0;
 }
 const saleMonthKey = (ms) => new Date(ms).toISOString().slice(0, 7);
+// Firebase RTDB forbids ., #, $, [, ], and / inside object keys.
+function firebaseSafeKeyPart(value) {
+  return String(value).replace(/[.#$\[\]\/]/g, (ch) => "_" + ch.charCodeAt(0).toString(16) + "_");
+}
 const cairoDay = (ms) => new Intl.DateTimeFormat("en-CA", { timeZone: "Africa/Cairo" }).format(ms);
 const fmtMoney = (n) => String(Math.round((Number(n) || 0) * 100) / 100);
 
@@ -1397,7 +1401,7 @@ async function backfillSales() {
   for (const [code, st] of Object.entries(all)) {
     if (!st || !st.createdAt || st.createdAt < since || st.importedAt || st.type === "trial" || have.has(String(code))) continue;
     const mk = saleMonthKey(st.createdAt);
-    (byMonth[mk] = byMonth[mk] || {})[`new_${code}_${st.createdAt}`] = {
+    (byMonth[mk] = byMonth[mk] || {})[`new_${firebaseSafeKeyPart(code)}_${st.createdAt}`] = {
       code: String(code), name: String(st.name || "").slice(0, 120), type: String(st.type || "custom"),
       price: priceForType(st.type), kind: "new", by: String(st.createdBy || ""), ts: st.createdAt
     };
@@ -1648,7 +1652,7 @@ function isMediaSegmentHost(urlOrHost) {
   return /floravon\.(online|shop)|c-cdn\.online|cloudfront\.shop/i.test(String(urlOrHost || ""));
 }
 
-async function streamFetch(session, url, extra = {}, clientHeaders = null) {
+async function streamFetch(session, url, extra = {}, clientHeaders = null, fetchOptions = {}) {
   if (!allowedStreamUrl(url, session)) throw new Error(`URL غير مسموح: ${url}`);
   const ch = clientHeaders || {};
   const headers = {
@@ -1659,7 +1663,7 @@ async function streamFetch(session, url, extra = {}, clientHeaders = null) {
     "X-Requested-With": CONFIG.STREAM_X_REQUESTED_WITH,
     "User-Agent": ch["user-agent"] || CONFIG.STREAM_UA
   };
-  if (!isMediaSegmentHost(url) && session?.token) {
+  if ((!isMediaSegmentHost(url) || fetchOptions.forceAuth === true) && session?.token) {
     headers.Authorization = `Bearer ${session.token}`;
   }
   for (const name of [
@@ -1671,7 +1675,7 @@ async function streamFetch(session, url, extra = {}, clientHeaders = null) {
   for (const [k, v] of Object.entries(extra || {})) {
     if (v != null && v !== "") headers[k] = v;
   }
-  if (isMediaSegmentHost(url)) delete headers.Authorization;
+  if (isMediaSegmentHost(url) && fetchOptions.forceAuth !== true) delete headers.Authorization;
   const hasRange = Boolean(headers.Range || headers.range);
   return upstreamSlot(() =>
     fetchT(url, { headers, cache: "no-store", redirect: "follow" }, {
@@ -2675,10 +2679,24 @@ async function getStreamSession(id, touch = true) {
   return s;
 }
 
+function setStudentStreamCookie(req, res) {
+  try {
+    const secure = (req.secure || req.headers["x-forwarded-proto"] === "https") ? "; Secure" : "";
+    if (req.sessionToken) {
+      res.setHeader(
+        "Set-Cookie",
+        `ds_session=${encodeURIComponent(req.sessionToken)}; Path=/; HttpOnly; SameSite=None${secure}; Max-Age=${7 * 24 * 3600}`
+      );
+    }
+  } catch {}
+}
+
 app.post("/api/play/:videoId", requireStudent, async (req, res) => {
   try {
     const videoId = String(req.params.videoId || "").trim();
     if (!videoId) return jsonError(res, 400, "videoId مطلوب");
+    // Needed by Safari/native HLS, which cannot attach an Authorization header to video.src.
+    setStudentStreamCookie(req, res);
 
     // ثناويكا ids → المسار القديم تحت
     const isThanawicaId = /^th[pvmy]_/i.test(videoId);
@@ -2897,7 +2915,7 @@ async function rewriteCoursatkPlaylist(sessionId, session, text, baseUrl, res, c
       if (uri && !keyFetched) {
         const keyUrl = new URL(uri, baseUrl).href;
         try { session.allowedHosts.add(new URL(keyUrl).hostname); } catch {}
-        const keyRes = await streamFetch(session, keyUrl, {}, clientHeaders);
+        const keyRes = await streamFetch(session, keyUrl, {}, clientHeaders, { forceAuth: true });
         if (!keyRes.ok) throw new Error("Key HTTP " + keyRes.status);
         const wrapped = Buffer.from(await keyRes.arrayBuffer());
         if (String(uri).includes("/user/auth/") || session.mode === "cdn") {
@@ -2938,7 +2956,7 @@ app.get("/api/cplay/manifest/:sessionId", requireStudent, async (req, res) => {
     if (session.ownerCode !== req.session.code) return jsonError(res, 403, "جلسة ليست لك");
 
     let master = await streamFetch(session, session.streamUrl, {}, req.headers);
-    if ((master.status === 401 || master.status === 403) && session.playId) {
+    if ((master.status === 401 || master.status === 403 || master.status === 404) && session.playId) {
       try {
         const data = await upstreamJson("/video/" + encodeURIComponent(session.playId) + "/stream-weave/play", {
           method: "POST",
