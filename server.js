@@ -356,7 +356,7 @@ const CONFIG = {
   PORT: Number(process.env.PORT || 8080),
   // Upstream Coursatk — token loaded from runtime/Firebase/env (never exposed to client)
   COURSATK_API: "https://api.coursatk.online/api/v1",
-  COURSATK_TOKEN: process.env.COURSATK_TOKEN || "", // provide via Fly Secrets or admin settings
+  COURSATK_TOKEN: process.env.COURSATK_TOKEN || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjo5MzA2Miwicm9sZSI6InN0dWRlbnQiLCJ1dWlkIjoiNWE5YTE4ZmU1NDZlMTE1NTNlMDQ2ZmFlM2UyYjE2MWYifQ.izWh_WEE5k55nRDwZpshxHNiXe1Be_V9wyGt32raVbw", // provide via Fly Secrets or admin settings
   DEFAULT_YEAR_ID: 4,
   STREAM_HOSTS: [
     "api.coursatk.online",
@@ -420,7 +420,7 @@ const RUNTIME_PATH = path.join(__dirname, "data", "runtime.json");
 
 const runtime = {
   firebaseUrl: (process.env.FIREBASE_URL || "https://plus-f09b5-default-rtdb.firebaseio.com").replace(/\/$/, ""),
-  coursatkToken: process.env.COURSATK_TOKEN || "",
+  coursatkToken: process.env.COURSATK_TOKEN || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjo5MzA2Miwicm9sZSI6InN0dWRlbnQiLCJ1dWlkIjoiNWE5YTE4ZmU1NDZlMTE1NTNlMDQ2ZmFlM2UyYjE2MWYifQ.izWh_WEE5k55nRDwZpshxHNiXe1Be_V9wyGt32raVbw",
   siteName: "كورساتك",
   packages: [
     { id: "month", name: "باقة الشهر — 30 يوم", price: 200, days: 30, hours: 0, active: true },
@@ -5011,4 +5011,3 @@ process.on("SIGTERM", () => {
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 10_000).unref();
 });
-
