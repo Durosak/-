@@ -68,11 +68,34 @@ for (const m of ["get", "post", "put", "patch", "delete", "use"]) {
     return orig(...args.map((a) => (typeof a === "function" && a.length < 4 ? wrapAsync(a) : a)));
   };
 }
-app.set("trust proxy", 1);
+// Trust only the configured number of reverse-proxy hops. Keep the deployment
+// default at one hop for the existing hosted setup; set TRUST_PROXY_HOPS=0
+// when the app is exposed directly, or match the actual proxy chain.
+const trustProxyHops = Number.parseInt(process.env.TRUST_PROXY_HOPS || "1", 10);
+app.set("trust proxy", Number.isInteger(trustProxyHops) && trustProxyHops >= 0 ? trustProxyHops : 1);
+
+// Credentialed CORS must use an explicit allowlist (never reflect arbitrary Origin).
+const allowedOrigins = new Set(
+  (process.env.CORS_ALLOWED_ORIGINS || "https://coursatk.online,https://www.coursatk.online,https://thanawya-club.vercel.app")
+    .split(",").map((x) => x.trim()).filter(Boolean)
+);
 app.use(cors({
-  origin: true, // يعكس الـ Origin عشان credentials تشتغل
-  credentials: true
+  origin(origin, callback) {
+    if (!origin || allowedOrigins.has(origin)) return callback(null, true);
+    return callback(null, false);
+  },
+  credentials: true,
+  methods: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
 }));
+
+// Baseline browser security headers. CSP is intentionally not forced here because
+// this API also serves existing frontend/player assets with inline scripts.
+app.use((_req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  next();
+});
 app.use(express.json({ limit: "20mb" }));
 app.use(
   compression({
@@ -356,7 +379,7 @@ const CONFIG = {
   PORT: Number(process.env.PORT || 8080),
   // Upstream Coursatk — token loaded from runtime/Firebase/env (never exposed to client)
   COURSATK_API: "https://api.coursatk.online/api/v1",
-  COURSATK_TOKEN: process.env.COURSATK_TOKEN || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjo5MzA2Miwicm9sZSI6InN0dWRlbnQiLCJ1dWlkIjoiNWE5YTE4ZmU1NDZlMTE1NTNlMDQ2ZmFlM2UyYjE2MWYifQ.izWh_WEE5k55nRDwZpshxHNiXe1Be_V9wyGt32raVbw", // provide via Fly Secrets or admin settings
+  COURSATK_TOKEN: process.env.COURSATK_TOKEN || "", // provide via Fly Secrets or admin settings
   DEFAULT_YEAR_ID: 4,
   STREAM_HOSTS: [
     "api.coursatk.online",
@@ -420,7 +443,7 @@ const RUNTIME_PATH = path.join(__dirname, "data", "runtime.json");
 
 const runtime = {
   firebaseUrl: (process.env.FIREBASE_URL || "https://plus-f09b5-default-rtdb.firebaseio.com").replace(/\/$/, ""),
-  coursatkToken: process.env.COURSATK_TOKEN || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjo5MzA2Miwicm9sZSI6InN0dWRlbnQiLCJ1dWlkIjoiNWE5YTE4ZmU1NDZlMTE1NTNlMDQ2ZmFlM2UyYjE2MWYifQ.izWh_WEE5k55nRDwZpshxHNiXe1Be_V9wyGt32raVbw",
+  coursatkToken: process.env.COURSATK_TOKEN || "",
   siteName: "كورساتك",
   packages: [
     { id: "month", name: "باقة الشهر — 30 يوم", price: 200, days: 30, hours: 0, active: true },
@@ -3309,10 +3332,9 @@ app.post("/api/admin/login", rateLimit({ max: 10, windowMs: 60_000, scope: "admi
     }
 
     if (username === CONFIG.BOOTSTRAP_ADMIN.username) {
-      const ok = Boolean(CONFIG.BOOTSTRAP_ADMIN.passwordPlain) && (
-        scryptVerify(password, CONFIG.BOOTSTRAP_ADMIN.passwordHash) ||
-        password === CONFIG.BOOTSTRAP_ADMIN.passwordPlain
-      );
+      const ok = Boolean(CONFIG.BOOTSTRAP_ADMIN.passwordHash) &&
+        scryptVerify(password, CONFIG.BOOTSTRAP_ADMIN.passwordHash);
+      if (!ok) return failAuth();
       adminId = "bootstrap";
       perms = CONFIG.BOOTSTRAP_ADMIN.permissions;
       admin = { username, permissions: perms, bootstrap: true };
@@ -4946,6 +4968,7 @@ setInterval(() => {
 // Boot: hash bootstrap password properly + load crypto
 if (CONFIG.BOOTSTRAP_ADMIN.passwordPlain) {
   CONFIG.BOOTSTRAP_ADMIN.passwordHash = scryptHash(CONFIG.BOOTSTRAP_ADMIN.passwordPlain);
+  CONFIG.BOOTSTRAP_ADMIN.passwordPlain = "";
 }
 await loadDecryptionUtils();
 try {
@@ -4999,7 +5022,7 @@ try {
 
 const server = app.listen(CONFIG.PORT, "0.0.0.0", () => {
   console.log(`[API ${APP_VERSION}] :${CONFIG.PORT} protected · segment-decrypt ON · segment-cache ${Math.round(SEG_CACHE_MAX / 1048576)}MB`);
-  console.log(`[API] bootstrap admin ready (Hema)`);
+  console.log(`[API] bootstrap admin ${CONFIG.BOOTSTRAP_ADMIN.passwordHash ? "enabled" : "disabled (set BOOTSTRAP_ADMIN_PASSWORD)"}`);
 });
 // Railway/الـ proxy بيفضّل الاتصال مفتوح أطول من الـ default بتاع Node (5 ثواني) — ده كان بيسبب ECONNRESET متقطع
 server.keepAliveTimeout = 65_000;
@@ -5011,3 +5034,4 @@ process.on("SIGTERM", () => {
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 10_000).unref();
 });
+
