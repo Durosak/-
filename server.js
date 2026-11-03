@@ -1160,15 +1160,30 @@ function getBearer(req) {
 // ── Student auth middleware ──
 // كان بيعمل 1-2 طلب Firebase مع كل request (حتى كل مقطع فيديو!) — دلوقتي كاش 15 ثانية + دمج الطلبات المتطابقة
 const AUTH_TTL_MS = 120_000;
+const AUTH_STALE_MS = 5 * 60_000;
+const AUTH_RETRY_MS = 15_000;
 const badTokens = new Map(); // token -> exp (توكنات مش موجودة — بلاش نسأل Firebase عنها كل مرة)
 
 async function getStudentCached(code) {
   const c = authCache.get(code);
   const t = Date.now();
   if (c && t < c.exp) return c.student;
-  const student = await coalesce("stu:" + code, () => fbGet(`students/${code}`));
-  authCache.set(code, { student, exp: Date.now() + AUTH_TTL_MS });
-  return student;
+  if (c && c.retryAt && t < c.retryAt && t < (c.staleUntil || 0)) return c.student;
+  try {
+    const student = await coalesce("stu:" + code, () => fbGet(`students/${code}`));
+    const fetchedAt = Date.now();
+    authCache.set(code, { student, exp: fetchedAt + AUTH_TTL_MS,
+      staleUntil: fetchedAt + AUTH_TTL_MS + AUTH_STALE_MS, retryAt: 0 });
+    return student;
+  } catch (e) {
+    // Firebase timeout عابر لا يقطع مشاهدة طالب تم التحقق منه مؤخرًا.
+    if (c && c.student && Date.now() < (c.staleUntil || c.exp + AUTH_STALE_MS)) {
+      c.retryAt = Date.now() + AUTH_RETRY_MS;
+      console.warn("[auth] Firebase delayed; using short-lived cached student", code);
+      return c.student;
+    }
+    throw e;
+  }
 }
 
 async function requireStudent(req, res, next) {
@@ -1345,7 +1360,7 @@ function priceForType(type) {
 const saleMonthKey = (ms) => new Date(ms).toISOString().slice(0, 7);
 // Firebase RTDB forbids ., #, $, [, ], and / inside object keys.
 function firebaseSafeKeyPart(value) {
-  return String(value).replace(/[.#$\[\]\/]/g, (ch) => "_" + ch.charCodeAt(0).toString(16) + "_");
+  return String(value).replace(/[.#$\[\]\/\u0000-\u001F\u007F]/g, (ch) => "_" + ch.charCodeAt(0).toString(16) + "_");
 }
 const cairoDay = (ms) => new Intl.DateTimeFormat("en-CA", { timeZone: "Africa/Cairo" }).format(ms);
 const fmtMoney = (n) => String(Math.round((Number(n) || 0) * 100) / 100);
@@ -1399,14 +1414,23 @@ async function backfillSales() {
   const have = new Set((await readSales(since)).filter((e) => e.kind === "new").map((e) => e.code));
   const byMonth = {};
   for (const [code, st] of Object.entries(all)) {
-    if (!st || !st.createdAt || st.createdAt < since || st.importedAt || st.type === "trial" || have.has(String(code))) continue;
-    const mk = saleMonthKey(st.createdAt);
-    (byMonth[mk] = byMonth[mk] || {})[`new_${firebaseSafeKeyPart(code)}_${st.createdAt}`] = {
+    const createdAt = Number(st && st.createdAt);
+    if (!st || !Number.isFinite(createdAt) || createdAt <= 0 || createdAt < since ||
+        st.importedAt || st.type === "trial" || have.has(String(code))) continue;
+    const mk = saleMonthKey(createdAt);
+    const safeCode = firebaseSafeKeyPart(code).slice(0, 100);
+    const entryKey = `new_${safeCode}_${Math.trunc(createdAt)}`;
+    (byMonth[mk] = byMonth[mk] || {})[entryKey] = {
       code: String(code), name: String(st.name || "").slice(0, 120), type: String(st.type || "custom"),
-      price: priceForType(st.type), kind: "new", by: String(st.createdBy || ""), ts: st.createdAt
+      price: priceForType(st.type), kind: "new", by: String(st.createdBy || ""), ts: createdAt
     };
   }
-  for (const [mk, obj] of Object.entries(byMonth)) await fbPatch(`sales/${mk}`, obj);
+  for (const [mk, obj] of Object.entries(byMonth)) {
+    const clean = Object.fromEntries(Object.entries(obj).filter(([key, value]) =>
+      key && !/[.#$\[\]\/\u0000-\u001F\u007F]/.test(key) && value && typeof value === "object"
+    ));
+    if (Object.keys(clean).length) await fbPatch(`sales/${mk}`, clean);
+  }
   await fbSet("sales_meta", { backfilledAt: now() });
 }
 
@@ -2888,11 +2912,37 @@ function playlistBodyFromSession(session) {
 function getCoursatkStreamSession(id) {
   const s = streamSessions.get(id);
   if (!s || s.kind !== "coursatk-stream") return null;
-  s.lastUsed = now();
+  const t = now();
+  if ((s.lastUsed && t - s.lastUsed > CONFIG.STREAM_IDLE_MS) ||
+      (s.createdAt && t - s.createdAt > CONFIG.STREAM_MAX_MS)) {
+    streamSessions.delete(id);
+    return null;
+  }
+  s.lastUsed = t;
   return s;
 }
 
-async function rewriteCoursatkPlaylist(sessionId, session, text, baseUrl, res, clientHeaders) {
+async function refreshCoursatkPlaySession(session) {
+  if (!session || !session.playId) throw new Error("جلسة المصدر غير مكتملة");
+  const data = await upstreamJson(
+    "/video/" + encodeURIComponent(session.playId) + "/stream-weave/play",
+    { method: "POST", headers: { Accept: "application/json" } }
+  );
+  const payload = data && data.data;
+  if (!payload || !payload.token || !payload.stream_url) {
+    throw new Error("المصدر لم يرجع توكن تشغيل صالح");
+  }
+  session.token = payload.token;
+  session.streamUrl = payload.stream_url;
+  if (!session.allowedHosts || typeof session.allowedHosts.add !== "function") {
+    session.allowedHosts = new Set(session.allowedHosts || []);
+  }
+  try { session.allowedHosts.add(new URL(payload.stream_url).hostname); } catch {}
+  session.lastTokenRefresh = now();
+  return session;
+}
+
+async function rewriteCoursatkPlaylist(sessionId, session, text, baseUrl, res, clientHeaders, refreshAttempted = false) {
   const lines = String(text || "").split(/\r?\n/);
   const out = [];
   let mediaSeq = 0;
@@ -2916,6 +2966,27 @@ async function rewriteCoursatkPlaylist(sessionId, session, text, baseUrl, res, c
         const keyUrl = new URL(uri, baseUrl).href;
         try { session.allowedHosts.add(new URL(keyUrl).hostname); } catch {}
         const keyRes = await streamFetch(session, keyUrl, {}, clientHeaders, { forceAuth: true });
+        if ((keyRes.status === 401 || keyRes.status === 403) && session.playId && !refreshAttempted) {
+          // الرابط القديم للمفتاح قد يكون موقّعًا وانتهت صلاحيته؛ جدّد التشغيل وأعد قراءة playlist جديدة.
+          await refreshCoursatkPlaySession(session);
+          const freshMaster = await streamFetch(session, session.streamUrl, {}, clientHeaders);
+          if (!freshMaster.ok) throw new Error("Refresh master HTTP " + freshMaster.status);
+          const freshText = await freshMaster.text();
+          const freshLines = freshText.split(/\r?\n/);
+          let freshVariant = null;
+          for (let i = 0; i < freshLines.length; i++) {
+            if (freshLines[i].trim().startsWith("#EXT-X-STREAM-INF")) {
+              const next = (freshLines[i + 1] || "").trim();
+              if (next && !next.startsWith("#")) { freshVariant = new URL(next, session.streamUrl).href; break; }
+            }
+          }
+          if (freshVariant) {
+            const freshMedia = await streamFetch(session, freshVariant, {}, clientHeaders);
+            if (!freshMedia.ok) throw new Error("Refresh variant HTTP " + freshMedia.status);
+            return rewriteCoursatkPlaylist(sessionId, session, await freshMedia.text(), freshVariant, res, clientHeaders, true);
+          }
+          return rewriteCoursatkPlaylist(sessionId, session, freshText, session.streamUrl, res, clientHeaders, true);
+        }
         if (!keyRes.ok) throw new Error("Key HTTP " + keyRes.status);
         const wrapped = Buffer.from(await keyRes.arrayBuffer());
         if (String(uri).includes("/user/auth/") || session.mode === "cdn") {
@@ -2958,18 +3029,11 @@ app.get("/api/cplay/manifest/:sessionId", requireStudent, async (req, res) => {
     let master = await streamFetch(session, session.streamUrl, {}, req.headers);
     if ((master.status === 401 || master.status === 403 || master.status === 404) && session.playId) {
       try {
-        const data = await upstreamJson("/video/" + encodeURIComponent(session.playId) + "/stream-weave/play", {
-          method: "POST",
-          headers: { Accept: "application/json" }
-        });
-        if (data && data.data && data.data.token) {
-          session.token = data.data.token;
-          if (data.data.stream_url) session.streamUrl = data.data.stream_url;
-        }
+        await refreshCoursatkPlaySession(session);
+        master = await streamFetch(session, session.streamUrl, {}, req.headers);
       } catch (e) {
-        console.warn("[cplay] refresh token", e.message);
+        console.warn("[cplay] refresh token:", e.message);
       }
-      master = await streamFetch(session, session.streamUrl, {}, req.headers);
     }
     if (!master.ok) return jsonError(res, 502, "Stream master HTTP " + master.status);
     const masterText = await master.text();
