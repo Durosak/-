@@ -1,17 +1,14 @@
-# fly.toml app configuration file generated for drisakplus on 2026-11-06T21:41:35Z
-#
-# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
-#
 
-app = 'drisakplus'
+app = 'pplus'
 primary_region = 'ams'
 
 [build]
+
 [http_service]
   internal_port = 3000
   force_https = true
   auto_stop_machines = 'off'
-  auto_start_machines = false
+  auto_start_machines = true
   min_machines_running = 1
   processes = ['app']
 
